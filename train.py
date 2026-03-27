@@ -167,9 +167,9 @@ class _LNWrapper(nn.Module):
 # ---------------------------------------------------------------------------
 
 DEVICE_BATCH_SIZE = 64
-BASE_LR = 4e-3  # higher LR for from-scratch (ConvNeXt canonical: 4e-3 with AdamW)
-WEIGHT_DECAY = 0.05  # canonical ConvNeXt weight decay
-WARMUP_STEPS = 200  # longer warmup for from-scratch stability
+BASE_LR = 4e-4  # reduced from 4e-3 — canonical ConvNeXt LR too high for 30k samples
+WEIGHT_DECAY = 0.05
+WARMUP_STEPS = 200
 LABEL_SMOOTHING = 0.1
 EVAL_FIRST_STEP = 300
 EVAL_EVERY_STEPS = 300
