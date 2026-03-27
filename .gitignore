@@ -21,3 +21,13 @@ dev/
 
 # Results file
 results.tsv
+
+# Training logs
+run.log
+*.log
+
+# Generated datasets (stored in ~/.cache/autoresearch/datasets/, not in repo)
+datasets/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
