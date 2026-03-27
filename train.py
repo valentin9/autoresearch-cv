@@ -367,3 +367,35 @@ print(f"total_images_k:      {total_images / 1000:.1f}")
 print(f"num_steps:           {step}")
 _m = model._orig_mod if hasattr(model, "_orig_mod") else model
 print(f"num_params_m:        {_m.num_params() / 1e6:.2f}")
+
+# ---------------------------------------------------------------------------
+# Per-class F1 breakdown (confusion analysis)
+# ---------------------------------------------------------------------------
+
+from sklearn.metrics import f1_score as _f1_score
+
+_val_loader = make_dataloader(
+    TASK_NAME, DEVICE_BATCH_SIZE, "val", pin_memory=(device.type == "cuda")
+)
+_all_preds, _all_labels = [], []
+with torch.no_grad():
+    for _images, _labels in _val_loader:
+        _images = _images.to(device)
+        with torch.amp.autocast(device_type=device.type, dtype=_autocast_dtype):
+            _logits = model(_images)
+        _all_preds.extend(_logits.argmax(1).cpu().tolist())
+        _all_labels.extend(_labels.tolist())
+
+_f1_per_class = _f1_score(_all_labels, _all_preds, average=None, zero_division=0)
+print()
+print("--- per-class F1 ---")
+for i, (name, f1) in enumerate(zip(CLASS_NAMES, _f1_per_class)):
+    bar = "█" * int(f1 * 20)
+    print(f"  {name:<25} {f1:.3f}  {bar}")
+
+# Bottom-5 most confused classes
+_worst = sorted(zip(_f1_per_class, CLASS_NAMES))[:5]
+print()
+print("worst 5 classes:")
+for f1, name in _worst:
+    print(f"  {name:<25} f1={f1:.3f}")
