@@ -24,6 +24,7 @@ from dataclasses import dataclass, asdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import timm
 
 from prepare import (
     IMG_SIZE,
@@ -43,6 +44,285 @@ import platform
 
 if platform.system() == "Darwin":
     _prepare.NUM_WORKERS = 0
+
+# ---------------------------------------------------------------------------
+# Scope
+# ---------------------------------------------------------------------------
+
+scope = load_scope()
+TASK_NAME = scope["task_name"]
+METRIC = scope["metric"]  # 'accuracy' | 'f1_macro' | 'f1_weighted'
+NUM_CLASSES = get_num_classes(TASK_NAME)
+CLASS_NAMES = get_class_names(TASK_NAME)
+
+print(f"Task:        {TASK_NAME}")
+print(f"Classes:     {CLASS_NAMES}")
+print(f"Num classes: {NUM_CLASSES}")
+print(f"Metric:      {METRIC}")
+print(f"Time budget: {TIME_BUDGET}s")
+print()
+
+# ---------------------------------------------------------------------------
+# Experiment 3: Pretrained ResNet-18 via timm (pipeline validation)
+#
+# Hypothesis: from-scratch models fail to converge in 20 min on MPS.
+# Using a pretrained backbone should converge fast and validate the pipeline.
+# If this also fails → dataset is broken. If it works → need better from-scratch
+# training strategy (e.g. more epochs, different LR, or architecture changes).
+#
+# NOTE: pretrained weights are used here ONLY as a diagnostic baseline.
+# The primary research goal remains from-scratch novel architectures.
+# ---------------------------------------------------------------------------
+
+
+class PretrainedClassifier(nn.Module):
+    """Thin wrapper around a timm pretrained backbone + classifier head."""
+
+    def __init__(
+        self,
+        model_name: str = "resnet18",
+        num_classes: int = 15,
+        pretrained: bool = True,
+    ):
+        super().__init__()
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            num_classes=num_classes,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(x)
+
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
+# ---------------------------------------------------------------------------
+# Hyperparameters
+# ---------------------------------------------------------------------------
+
+DEVICE_BATCH_SIZE = 64
+TOTAL_BATCH_SIZE = 128  # smaller effective batch for pretrained fine-tuning
+BASE_LR = 1e-3  # higher LR for head, backbone will need lower
+WEIGHT_DECAY = 1e-4
+WARMUP_RATIO = 0.05
+LABEL_SMOOTHING = 0.1
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+
+t_start = time.time()
+torch.manual_seed(42)
+torch.set_float32_matmul_precision("high")
+
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+    torch.cuda.manual_seed(42)
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+
+print(f"Device: {device}")
+
+_autocast_dtype = torch.bfloat16 if device.type in ("cuda", "mps") else torch.float32
+autocast_ctx = torch.amp.autocast(device_type=device.type, dtype=_autocast_dtype)
+
+_DEVICE_PEAK_FLOPS = {
+    "cuda": 82.6e12,
+    "mps": 14.2e12,
+    "cpu": 1.0e12,
+}
+
+model = PretrainedClassifier(
+    model_name="resnet18",
+    num_classes=NUM_CLASSES,
+    pretrained=True,
+).to(device)
+print(f"Model params: {model.num_params() / 1e6:.2f}M")
+
+# torch.compile works on CUDA and CPU; skip on MPS (not yet fully supported)
+if device.type != "mps":
+    model = torch.compile(model, dynamic=False)
+
+assert TOTAL_BATCH_SIZE % DEVICE_BATCH_SIZE == 0
+grad_accum_steps = TOTAL_BATCH_SIZE // DEVICE_BATCH_SIZE
+
+train_loader = make_dataloader(
+    TASK_NAME, DEVICE_BATCH_SIZE, "train", pin_memory=(device.type == "cuda")
+)
+images_per_epoch = len(train_loader) * DEVICE_BATCH_SIZE
+
+# Use different LR for backbone vs head (standard fine-tuning)
+backbone_params = [
+    p for n, p in model.named_parameters() if "head" not in n and "fc" not in n
+]
+head_params = [p for n, p in model.named_parameters() if "head" in n or "fc" in n]
+print(f"Backbone params: {sum(p.numel() for p in backbone_params) / 1e6:.2f}M")
+print(f"Head params: {sum(p.numel() for p in head_params) / 1e6:.2f}M")
+
+optimizer = torch.optim.AdamW(
+    [
+        {"params": backbone_params, "lr": BASE_LR * 0.1},  # 10x lower for backbone
+        {"params": head_params, "lr": BASE_LR},
+    ],
+    weight_decay=WEIGHT_DECAY,
+    betas=(0.9, 0.999),
+    eps=1e-8,
+    fused=(device.type == "cuda"),
+)
+
+criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+
+
+def get_lr_scale(step_progress: float) -> float:
+    """Cosine with warmup, returns scale factor [0, 1]."""
+    warmup_steps = WARMUP_RATIO
+    if step_progress < warmup_steps:
+        return step_progress / warmup_steps if warmup_steps > 0 else 1.0
+    t = (step_progress - warmup_steps) / max(1e-8, 1.0 - warmup_steps)
+    return 0.5 * (1 + math.cos(math.pi * t))
+
+
+print(f"Grad accum steps:   {grad_accum_steps}")
+print(f"Images per epoch:   {images_per_epoch:,}")
+print(f"Total batch size:   {TOTAL_BATCH_SIZE}")
+print()
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+
+
+def device_synchronize():
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def peak_memory_mb() -> float:
+    if device.type == "cuda":
+        return torch.cuda.max_memory_allocated() / 1024 / 1024
+    elif device.type == "mps":
+        return torch.mps.current_allocated_memory() / 1024 / 1024
+    return 0.0
+
+
+t_start_training = time.time()
+total_training_time = 0.0
+step = 0
+total_images = 0
+smooth_loss = 0.0
+train_iter = iter(train_loader)
+
+while True:
+    device_synchronize()
+    t0 = time.time()
+
+    optimizer.zero_grad(set_to_none=True)
+    batch_loss = 0.0
+
+    for micro_step in range(grad_accum_steps):
+        try:
+            images, labels = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            images, labels = next(train_iter)
+
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        with autocast_ctx:
+            logits = model(images)
+            loss = criterion(logits, labels) / grad_accum_steps
+
+        loss.backward()
+        batch_loss += loss.item()
+
+    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+    progress = min(total_training_time / TIME_BUDGET, 1.0)
+    lr_scale = get_lr_scale(progress)
+    for pg in optimizer.param_groups:
+        pg["lr"] = pg["initial_lr"] * lr_scale if "initial_lr" in pg else pg["lr"]
+
+    # Manual LR update based on progress
+    warmup_frac = WARMUP_RATIO
+    if progress < warmup_frac:
+        lr_scale = (progress / warmup_frac) if warmup_frac > 0 else 1.0
+    else:
+        t = (progress - warmup_frac) / max(1e-8, 1.0 - warmup_frac)
+        lr_scale = 0.5 * (1 + math.cos(math.pi * t))
+
+    optimizer.param_groups[0]["lr"] = BASE_LR * 0.1 * lr_scale
+    optimizer.param_groups[1]["lr"] = BASE_LR * lr_scale
+
+    optimizer.step()
+
+    device_synchronize()
+    t1 = time.time()
+    dt = t1 - t0
+
+    if step > 5:
+        total_training_time += dt
+
+    total_images += TOTAL_BATCH_SIZE
+    ema_beta = 0.95
+    smooth_loss = (
+        ema_beta * smooth_loss + (1 - ema_beta) * batch_loss * grad_accum_steps
+    )
+    debiased = smooth_loss / (1 - ema_beta ** (step + 1))
+    pct_done = 100 * progress
+    remaining = max(0, TIME_BUDGET - total_training_time)
+    imgs_per_sec = int(TOTAL_BATCH_SIZE / dt)
+
+    print(
+        f"\rstep {step:05d} ({pct_done:.1f}%) | "
+        f"loss: {debiased:.4f} | lr: {optimizer.param_groups[1]['lr']:.2e} | "
+        f"imgs/s: {imgs_per_sec:,} | remaining: {remaining:.0f}s    ",
+        end="",
+        flush=True,
+    )
+
+    if step == 0:
+        gc.collect()
+        gc.freeze()
+        gc.disable()
+
+    step += 1
+
+    if step > 5 and total_training_time >= TIME_BUDGET:
+        break
+
+print()
+
+# ---------------------------------------------------------------------------
+# Final evaluation
+# ---------------------------------------------------------------------------
+
+model.eval()
+with autocast_ctx:
+    results = evaluate(model, TASK_NAME, DEVICE_BATCH_SIZE, metric=METRIC)
+
+t_end = time.time()
+peak_vram_mb = peak_memory_mb()
+
+primary_value = results["primary_metric"]
+print("---")
+print(f"val_{METRIC}:        {primary_value:.6f}")
+print(f"val_accuracy:        {results['accuracy']:.6f}")
+print(f"val_f1_macro:        {results['f1_macro']:.6f}")
+print(f"val_f1_weighted:     {results['f1_weighted']:.6f}")
+print(f"val_samples:         {results['num_samples']}")
+print(f"training_seconds:    {total_training_time:.1f}")
+print(f"total_seconds:       {t_end - t_start:.1f}")
+print(f"peak_vram_mb:        {peak_vram_mb:.1f}")
+print(f"total_images_k:      {total_images / 1000:.1f}")
+print(f"num_steps:           {step}")
+_m = model._orig_mod if hasattr(model, "_orig_mod") else model
+print(f"num_params_m:        {_m.num_params() / 1e6:.2f}")
+
 
 # ---------------------------------------------------------------------------
 # Scope
