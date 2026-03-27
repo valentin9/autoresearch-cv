@@ -403,18 +403,19 @@ class FontDatasetGenerator(SyntheticDatasetGenerator):
     def _render_sample(self, font_name: str) -> Image.Image:
         W = H = self.img_size
 
-        # Pick text
+        # Pick text — prefer longer strings that expose more glyph shapes
         text = random.choice(ALL_TEXTS)
-        # Sometimes use just a word or two
-        if random.random() < 0.3 and len(text.split()) > 2:
+        # Sometimes use just a word or two for variety
+        if random.random() < 0.2 and len(text.split()) > 2:
             words = text.split()
-            text = " ".join(words[: random.randint(1, 3)])
+            text = " ".join(words[: random.randint(2, 4)])
 
         # Background
         bg = _make_background(W, H)
 
-        # Font size: vary between 16 and 72
-        font_size = random.randint(16, 72)
+        # Font size: LARGER range — tiny fonts don't reveal font-specific features
+        # At 224px image, use 28-72px so glyphs are clearly visible
+        font_size = random.randint(28, 72)
         font = self._get_pil_font(font_name, font_size)
 
         draw = ImageDraw.Draw(bg)
@@ -427,28 +428,33 @@ class FontDatasetGenerator(SyntheticDatasetGenerator):
         except Exception:
             tw, th = font_size * len(text) // 2, font_size
 
-        # If text is too wide, wrap or truncate
-        max_chars = max(1, int(W * 0.9 / max(1, font_size * 0.55)))
-        if tw > W * 0.95:
-            text = text[:max_chars]
+        # If text is too wide, truncate to fit within image width with margin
+        margin = 10
+        max_w = W - 2 * margin
+        while tw > max_w and len(text) > 3:
+            text = text[:-2]
             try:
                 bbox = draw.textbbox((0, 0), text, font=font)
                 tw = bbox[2] - bbox[0]
                 th = bbox[3] - bbox[1]
             except Exception:
-                tw, th = font_size * len(text) // 2, font_size
+                tw = font_size * len(text) // 2
+                th = font_size
 
-        # Position: random but centered-ish
-        margin = 8
-        x = random.randint(margin, max(margin, W - tw - margin))
-        y = random.randint(margin, max(margin, H - th - margin))
+        # Position: mostly centered with small random jitter (helps model focus on glyphs)
+        center_x = W // 2 - tw // 2
+        center_y = H // 2 - th // 2
+        jitter_x = random.randint(-20, 20)
+        jitter_y = random.randint(-20, 20)
+        x = max(margin, min(W - tw - margin, center_x + jitter_x))
+        y = max(margin, min(H - th - margin, center_y + jitter_y))
 
         # Text color
         color = _text_color(bg, x, y)
 
         # Optional slight shadow for realism
-        if random.random() < 0.3:
-            shadow_offset = random.randint(1, 3)
+        if random.random() < 0.2:
+            shadow_offset = random.randint(1, 2)
             shadow_color = tuple(
                 max(0, c - 60) if sum(color) > 300 else min(255, c + 60) for c in color
             )
@@ -461,9 +467,9 @@ class FontDatasetGenerator(SyntheticDatasetGenerator):
 
         draw.text((x, y), text, font=font, fill=color)
 
-        # Optional blur (simulate slight defocus)
-        if random.random() < 0.15:
-            bg = bg.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.5, 1.2)))
+        # Optional blur (simulate slight defocus) — less aggressive
+        if random.random() < 0.1:
+            bg = bg.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.3, 0.8)))
 
         # Optional JPEG-like noise
         if random.random() < 0.1:

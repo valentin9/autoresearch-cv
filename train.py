@@ -62,15 +62,17 @@ print(f"Time budget: {TIME_BUDGET}s")
 print()
 
 # ---------------------------------------------------------------------------
-# Baseline Model: ConvNeXt-Micro (custom, from scratch)
+# Experiment 2: Smaller ConvNeXt-Nano + improved dataset (larger fonts, centered text)
 #
-# Intentionally NOT a standard ResNet — more interesting starting point.
-# The agent is expected to evolve this architecture significantly.
-# Key properties:
-#   - Depthwise separable convolutions (efficient)
-#   - Inverted bottleneck (wide hidden dim, narrow residual)
-#   - LayerNorm after each stage
-#   - Global average pooling -> classifier
+# Hypothesis: baseline failed because:
+#   1. Dataset had tiny fonts (16px) making glyphs unreadable
+#   2. Model (7M params) too large to converge in 20min on MPS (~100 imgs/s)
+#
+# Changes:
+#   - Dataset regenerated with font_size 28-72px, centered text
+#   - Smaller model (2.5M params) = more steps per second
+#   - Lower LR (1e-3) — large lr caused instability/plateau in exp 1
+#   - Reduced label smoothing (0.05) — less noise in 15-class problem
 # ---------------------------------------------------------------------------
 
 
@@ -78,15 +80,15 @@ print()
 class MicroConvConfig:
     img_size: int = IMG_SIZE
     num_classes: int = NUM_CLASSES
-    # Stage channels and depths: list of (channels, num_blocks)
+    # Smaller model for faster iteration on MPS
     stages: tuple = (
-        (64, 2),  # stage 1
-        (128, 2),  # stage 2
-        (256, 4),  # stage 3
-        (512, 2),  # stage 4
+        (32, 2),  # stage 1
+        (64, 2),  # stage 2
+        (128, 3),  # stage 3
+        (256, 2),  # stage 4
     )
-    expansion: int = 4  # inverted bottleneck expansion factor
-    drop_path_rate: float = 0.1
+    expansion: int = 4
+    drop_path_rate: float = 0.05
 
 
 def drop_path(x, drop_prob: float = 0.0, training: bool = False):
@@ -244,23 +246,23 @@ class MicroConvNet(nn.Module):
 # Training
 DEVICE_BATCH_SIZE = 64  # images per forward pass (reduce if OOM)
 TOTAL_BATCH_SIZE = 256  # effective batch size (with gradient accumulation)
-BASE_LR = 4e-3  # peak learning rate
-WEIGHT_DECAY = 0.05  # AdamW weight decay
-WARMUP_RATIO = 0.05  # fraction of budget for LR warmup
-LABEL_SMOOTHING = 0.1  # cross-entropy label smoothing
+BASE_LR = 1e-3  # reduced from 4e-3 — exp 1 showed plateau at high LR
+WEIGHT_DECAY = 0.05
+WARMUP_RATIO = 0.05
+LABEL_SMOOTHING = 0.05  # reduced from 0.1 — less noise for fine-grained task
 
 # Model config (edit freely)
 MODEL_CONFIG = MicroConvConfig(
     img_size=IMG_SIZE,
     num_classes=NUM_CLASSES,
     stages=(
+        (32, 2),
         (64, 2),
-        (128, 2),
-        (256, 4),
-        (512, 2),
+        (128, 3),
+        (256, 2),
     ),
     expansion=4,
-    drop_path_rate=0.1,
+    drop_path_rate=0.05,
 )
 
 # ---------------------------------------------------------------------------
