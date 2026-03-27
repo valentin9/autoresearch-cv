@@ -35,6 +35,14 @@ from prepare import (
     make_dataloader,
     evaluate,
 )
+import prepare as _prepare
+
+# On macOS (spawn-based multiprocessing), DataLoader workers cause re-execution of
+# train.py which crashes. Force single-threaded loading on macOS.
+import platform
+
+if platform.system() == "Darwin":
+    _prepare.NUM_WORKERS = 0
 
 # ---------------------------------------------------------------------------
 # Scope
