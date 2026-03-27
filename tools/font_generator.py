@@ -425,23 +425,93 @@ class FontDatasetGenerator(SyntheticDatasetGenerator):
         """
         Render text in the target font as a tight crop.
 
-        Strategy: render text on a large canvas, find the tight bounding box of
-        the actual pixels, add small padding, then resize to img_size×img_size.
-        This maximizes the fraction of the image occupied by font-discriminative
-        glyph shapes rather than background.
+        Strategy: build a multi-line paragraph (2-4 lines, ≥40 chars total),
+        render on a generously-sized canvas, tight-crop to the actual pixel
+        bounding box, then letterbox-resize to img_size×img_size (≤20% distortion).
+
+        Multi-line gives richer glyph coverage (ascenders, descenders, spacing,
+        leading) and naturally produces a squarer crop that wastes less padding.
         """
         W = H = self.img_size
+        MIN_CHARS = 50  # minimum total characters across all lines
 
-        # Pick text — use strings that expose multiple glyphs across all fonts
-        text = random.choice(ALL_TEXTS)
-        # Use a moderate-length string (not too short, not too long)
-        words = text.split()
-        if len(words) > 5:
-            text = " ".join(words[: random.randint(3, 5)])
-        elif len(words) < 2 and len(text) > 10:
-            text = text[: random.randint(8, 15)]
+        # --- Build a multi-line paragraph ---
+        # Combine two pangrams/sentences to guarantee ≥50 chars and glyph diversity.
+        base = random.choice(PANGRAMS) + " " + random.choice(SENTENCES)
+        # Shuffle in a random word occasionally for variation
+        if random.random() < 0.4:
+            base = base + " " + random.choice(WORDS)
 
-        # Background: mostly clean (white/light) with occasional dark
+        # Font size: moderate — large enough to see glyph detail, small enough
+        # to fit 2-3 lines on a reasonable canvas.
+        font_size = random.randint(36, 72)
+        font = self._get_pil_font(font_name, font_size)
+
+        # Wrap width: target ~20-25 chars per line so we get 2-3 lines.
+        # Measure a reference character width to estimate pixels per char.
+        canvas_w = 900
+        canvas_h = 600  # tall enough for several lines
+
+        draw_tmp = ImageDraw.Draw(Image.new("RGB", (canvas_w, canvas_h)))
+
+        def measure(t):
+            try:
+                b = draw_tmp.textbbox((0, 0), t, font=font)
+                return b[2] - b[0], b[3] - b[1]
+            except Exception:
+                return font_size * len(t) // 2, font_size
+
+        # Estimate pixels per character and set wrap width for ~12 chars/line
+        # → 4-5 lines → blocky aspect ratio that fills the 224×224 image well
+        char_w = measure("abcdefghijklmnopqrstuvwxyz")[0] / 26
+        wrap_px = max(int(char_w * 12), 60)  # ~12 chars per line
+
+        # Word-wrap into lines using the narrow wrap width
+        words = base.split()
+        lines = []
+        current = ""
+        for word in words:
+            candidate = (current + " " + word).strip()
+            w, _ = measure(candidate)
+            if w > wrap_px and current:
+                lines.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+
+        # Add a second source string as another line if we have fewer than 2 lines
+        # or if total chars is still low
+        total_chars = sum(len(l) for l in lines)
+        if len(lines) < 2 or total_chars < MIN_CHARS:
+            extra = random.choice(PANGRAMS + SENTENCES)
+            extra_words = extra.split()
+            current2 = ""
+            for word in extra_words:
+                candidate = (current2 + " " + word).strip()
+                w, _ = measure(candidate)
+                if w > wrap_px and current2:
+                    lines.append(current2)
+                    current2 = word
+                    break
+                else:
+                    current2 = candidate
+            if current2:
+                lines.append(current2)
+
+        # Keep 2-6 lines max
+        lines = lines[:6]
+
+        # --- Measure total block size ---
+        line_h = measure("Ag")[
+            1
+        ]  # representative height including ascenders/descenders
+        line_spacing = int(line_h * 1.3)
+        block_h = line_spacing * (len(lines) - 1) + line_h
+        block_w = max(measure(l)[0] for l in lines)
+
+        # --- Background and text colours (greyscale) ---
         dark_bg = random.random() < 0.3
         if dark_bg:
             bg_val = random.randint(10, 60)
@@ -452,93 +522,50 @@ class FontDatasetGenerator(SyntheticDatasetGenerator):
         bg_color = (bg_val, bg_val, bg_val)
         text_color = (text_val, text_val, text_val)
 
-        # Font size: render at large size, then resize → better glyph detail
-        font_size = random.randint(48, 96)
-        font = self._get_pil_font(font_name, font_size)
-
-        # Render on a large canvas
-        canvas_w = 1200
-        canvas_h = 256
-        canvas = Image.new("RGB", (canvas_w, canvas_h), bg_color)
+        # --- Render ---
+        # Make canvas just big enough for the text block + padding
+        pad = max(12, int(block_h * 0.15))
+        c_w = block_w + 2 * pad
+        c_h = block_h + 2 * pad
+        canvas = Image.new("RGB", (c_w, c_h), bg_color)
         draw = ImageDraw.Draw(canvas)
 
-        # Measure text
-        try:
-            bbox = draw.textbbox((0, 0), text, font=font)
-            tw = bbox[2] - bbox[0]
-            th = bbox[3] - bbox[1]
-        except Exception:
-            tw, th = font_size * len(text) // 2, font_size
+        y_cursor = pad
+        for line in lines:
+            draw.text((pad, y_cursor), line, font=font, fill=text_color)
+            y_cursor += line_spacing
 
-        # If too wide, truncate
-        while tw > canvas_w - 20 and len(text) > 3:
-            text = text[:-2].rstrip()
-            try:
-                bbox = draw.textbbox((0, 0), text, font=font)
-                tw = bbox[2] - bbox[0]
-                th = bbox[3] - bbox[1]
-            except Exception:
-                break
-
-        # Center on canvas
-        x = max(5, (canvas_w - tw) // 2)
-        y = max(5, (canvas_h - th) // 2)
-
-        # Slight color randomization for variation
-        r_jitter = random.randint(-15, 15)
-        g_jitter = random.randint(-15, 15)
-        b_jitter = random.randint(-15, 15)
-        actual_text_color = (
-            max(0, min(255, text_val + r_jitter)),
-            max(0, min(255, text_val + g_jitter)),
-            max(0, min(255, text_val + b_jitter)),
-        )
-
-        draw.text((x, y), text, font=font, fill=actual_text_color)
-
-        # Find tight bounding box of non-background pixels
+        # --- Tight crop on actual pixels ---
         arr = np.array(canvas)
         if dark_bg:
-            # Text is light: find bright pixels
             mask = arr.max(axis=2) > (bg_val + 20)
         else:
-            # Text is dark: find dark pixels
             mask = arr.min(axis=2) < (bg_val - 20)
 
-        rows = np.any(mask, axis=1)
-        cols = np.any(mask, axis=0)
-
-        if rows.any() and cols.any():
-            rmin, rmax = np.where(rows)[0][[0, -1]]
-            cmin, cmax = np.where(cols)[0][[0, -1]]
-            # Add padding (10% of text height)
-            pad = max(8, int((rmax - rmin) * 0.15))
-            rmin = max(0, rmin - pad)
-            rmax = min(canvas_h - 1, rmax + pad)
-            cmin = max(0, cmin - pad)
-            cmax = min(canvas_w - 1, cmax + pad)
+        if mask.any():
+            rows_idx = np.where(np.any(mask, axis=1))[0]
+            cols_idx = np.where(np.any(mask, axis=0))[0]
+            rmin, rmax = rows_idx[0], rows_idx[-1]
+            cmin, cmax = cols_idx[0], cols_idx[-1]
+            crop_pad = max(8, int((rmax - rmin) * 0.10))
+            rmin = max(0, rmin - crop_pad)
+            rmax = min(c_h - 1, rmax + crop_pad)
+            cmin = max(0, cmin - crop_pad)
+            cmax = min(c_w - 1, cmax + crop_pad)
             crop = canvas.crop((cmin, rmin, cmax + 1, rmax + 1))
         else:
-            # Fallback if no text rendered
-            crop = canvas.crop((x, y, x + max(tw, 10) + 10, y + max(th, 10) + 10))
+            crop = canvas  # fallback
 
-        # Resize with aspect ratio preservation (letterbox).
-        # Scale so the longer side fits within W or H, then pad the shorter side.
+        # --- Letterbox resize to W×H (preserves aspect ratio, ≤20% distortion) ---
         cw, ch = crop.size
         scale = min(W / cw, H / ch)
         new_w = max(1, int(round(cw * scale)))
         new_h = max(1, int(round(ch * scale)))
-
-        # Cap distortion: if scale would squish/stretch beyond 20%, use letterbox
         resized = crop.resize((new_w, new_h), Image.LANCZOS)
-
-        # Pad to W×H with background color
         img = Image.new("RGB", (W, H), bg_color)
-        paste_x = (W - new_w) // 2
-        paste_y = (H - new_h) // 2
-        img.paste(resized, (paste_x, paste_y))
+        img.paste(resized, ((W - new_w) // 2, (H - new_h) // 2))
 
-        # Light augmentation: mild blur and noise
+        # Light augmentation
         if random.random() < 0.1:
             img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.3, 0.7)))
         if random.random() < 0.1:
