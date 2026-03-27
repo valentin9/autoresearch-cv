@@ -64,16 +64,15 @@ print(f"Time budget: {TIME_BUDGET}s")
 print()
 
 # ---------------------------------------------------------------------------
-# Experiment 5: ResNet-18 pretrained, step-count LR schedule (fix warmup bug)
+# Experiment 8: ResNet-18 pretrained, no grad accum, constant LR, direct convergence
 #
-# Root cause of exp 3/4 failure: TIME-based warmup causes near-zero LR for
-# first 120s of 1200s budget. Model barely learns during warmup phase.
-# Steps 0-5 have total_training_time=0 (LR=0), and warmup reaches peak LR
-# only at t=120s. This starves the model of gradient signal early on.
+# Root cause debugging: the step-count LR warmup with grad_accum=2 causes slow
+# convergence compared to direct training. Key findings:
+# - Direct test (bs=64, lr=3e-4 constant): 300 steps → val_f1=0.58
+# - train.py (bs=128 eff, warmup 100 steps): still at 0.028 after full 1200s
 #
-# Fix: use STEP-COUNT-based LR schedule. Estimate total steps from initial
-# throughput measurement, then schedule properly on steps not wall time.
-# Also: longer warmup in steps terms (100 steps), cosine from there.
+# Fix: remove grad accumulation, use bs=64 directly, use constant LR from step 1
+# (small warmup over 50 steps). This matches the working direct test setup.
 # ---------------------------------------------------------------------------
 
 
@@ -96,10 +95,10 @@ class PretrainedClassifier(nn.Module):
 # ---------------------------------------------------------------------------
 
 DEVICE_BATCH_SIZE = 64
-TOTAL_BATCH_SIZE = 128
+TOTAL_BATCH_SIZE = 64  # NO grad accumulation — matches working direct test
 BASE_LR = 3e-4
 WEIGHT_DECAY = 1e-4
-WARMUP_STEPS = 100  # warmup for 100 optimizer steps (not time-based)
+WARMUP_STEPS = 50  # short warmup
 LABEL_SMOOTHING = 0.1
 
 # ---------------------------------------------------------------------------
@@ -165,16 +164,14 @@ def peak_memory_mb():
     return 0.0
 
 
-# Estimate total steps based on device capability (no warmup measurement to avoid state pollution)
-# MPS (Apple M-series): ~1.5 steps/sec with grad_accum=2, ResNet-18
-# RTX 4090 CUDA: ~50+ steps/sec
+# Estimate total steps based on device capability
 _device_steps_est = {
-    "cuda": 50.0,
-    "mps": 1.5,
-    "cpu": 0.3,
+    "cuda": 100.0,  # RTX 4090 with bs=64
+    "mps": 3.0,  # Apple M-series with bs=64 (no grad accum)
+    "cpu": 0.5,
 }
-_est_steps_per_sec = _device_steps_est.get(device.type, 1.0) / grad_accum_steps
-TOTAL_STEPS = max(500, int(_est_steps_per_sec * TIME_BUDGET))
+TOTAL_STEPS = max(1000, int(_device_steps_est.get(device.type, 1.0) * TIME_BUDGET))
+EVAL_EVERY_STEPS = max(100, TOTAL_STEPS // 5)
 
 model.train()
 train_loader = make_dataloader(
