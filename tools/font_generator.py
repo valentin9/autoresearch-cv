@@ -143,7 +143,28 @@ FONT_DIRECT_URLS = {
     "Nunito": f"{_GH}/ofl/nunito/Nunito[wght].ttf",
     "Ubuntu": f"{_GH}/ufl/ubuntu/Ubuntu-Regular.ttf",
 }
-FONT_URLS = {k: None for k in ["Arial", "Times New Roman", "Georgia"]}
+# Exact system font paths for fonts not on Google Fonts (Microsoft/system fonts)
+# These are pinned to avoid fuzzy matching picking wrong fonts (e.g. SFGeorgian ≠ Georgia)
+SYSTEM_FONT_EXACT = {
+    "Arial": [
+        "/Library/Fonts/Arial.ttf",
+        "/Library/Fonts/Arial Unicode.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/Arial.ttf",
+    ],
+    "Times New Roman": [
+        "/Library/Fonts/Times New Roman.ttf",
+        "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+        "C:/Windows/Fonts/times.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/Times_New_Roman.ttf",
+    ],
+    "Georgia": [
+        "/System/Library/Fonts/Supplemental/Georgia.ttf",
+        "/Library/Fonts/Georgia.ttf",
+        "C:/Windows/Fonts/georgia.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/Georgia.ttf",
+    ],
+}
 
 # Variant preference order for each font (we want Regular/400 weight)
 VARIANT_PREFERENCE = [
@@ -213,20 +234,20 @@ def download_font(font_name: str, cache_dir: Path = FONT_CACHE_DIR) -> Optional[
     if existing:
         return _pick_best_variant(existing)
 
+    # For system fonts with exact known paths, use those directly (avoids fuzzy match)
+    if font_name in SYSTEM_FONT_EXACT:
+        for candidate in SYSTEM_FONT_EXACT[font_name]:
+            p = Path(candidate)
+            if p.exists():
+                print(f"  Found system font: {font_name} -> {p}")
+                return p
+        print(f"  WARNING: {font_name} not found at known system paths")
+        return None
+
     # If there's a direct URL, prefer downloading over system font lookup
     # (avoids picking up wrong variants like Roboto Mono for Roboto)
-    has_direct_url = font_name in FONT_DIRECT_URLS
-
-    # Try system fonts only for fonts without a direct URL
-    if not has_direct_url:
-        sys_font = _find_system_font(font_name)
-        if sys_font:
-            print(f"  Found system font: {font_name} -> {sys_font}")
-            return sys_font
-
-    # Try direct GitHub raw URL
-    url = FONT_DIRECT_URLS.get(font_name)
-    if url:
+    if font_name in FONT_DIRECT_URLS:
+        url = FONT_DIRECT_URLS[font_name]
         ttf_path = font_dir / Path(url).name
         try:
             print(f"  Downloading {font_name} from GitHub...", end=" ", flush=True)
@@ -490,8 +511,8 @@ class FontDatasetGenerator(SyntheticDatasetGenerator):
         if rows.any() and cols.any():
             rmin, rmax = np.where(rows)[0][[0, -1]]
             cmin, cmax = np.where(cols)[0][[0, -1]]
-            # Add padding (10% of text size)
-            pad = max(8, int((rmax - rmin) * 0.12))
+            # Add padding (10% of text height)
+            pad = max(8, int((rmax - rmin) * 0.15))
             rmin = max(0, rmin - pad)
             rmax = min(canvas_h - 1, rmax + pad)
             cmin = max(0, cmin - pad)
@@ -499,10 +520,23 @@ class FontDatasetGenerator(SyntheticDatasetGenerator):
             crop = canvas.crop((cmin, rmin, cmax + 1, rmax + 1))
         else:
             # Fallback if no text rendered
-            crop = canvas.crop((x, y, x + tw + 10, y + th + 10))
+            crop = canvas.crop((x, y, x + max(tw, 10) + 10, y + max(th, 10) + 10))
 
-        # Resize to target size
-        img = crop.resize((W, H), Image.LANCZOS)
+        # Resize with aspect ratio preservation (letterbox).
+        # Scale so the longer side fits within W or H, then pad the shorter side.
+        cw, ch = crop.size
+        scale = min(W / cw, H / ch)
+        new_w = max(1, int(round(cw * scale)))
+        new_h = max(1, int(round(ch * scale)))
+
+        # Cap distortion: if scale would squish/stretch beyond 20%, use letterbox
+        resized = crop.resize((new_w, new_h), Image.LANCZOS)
+
+        # Pad to W×H with background color
+        img = Image.new("RGB", (W, H), bg_color)
+        paste_x = (W - new_w) // 2
+        paste_y = (H - new_h) // 2
+        img.paste(resized, (paste_x, paste_y))
 
         # Light augmentation: mild blur and noise
         if random.random() < 0.1:
