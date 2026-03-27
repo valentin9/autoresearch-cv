@@ -22,7 +22,6 @@ import gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import timm
 
 from prepare import (
     IMG_SIZE,
@@ -61,33 +60,106 @@ print(f"Time budget: {TIME_BUDGET}s")
 print()
 
 # ---------------------------------------------------------------------------
-# Experiment 1 (clean restart): Pretrained ResNet-18 — pipeline ceiling
+# Experiment 2: ConvNeXt-Micro from scratch
 #
-# Dataset: fixed (BW, multi-line, letterbox, correct fonts, ≥50 chars).
-# Training fixes applied:
-#   - Step-count LR warmup (not time-based)
-#   - No grad accumulation (bs=64 direct, matches validated direct test)
-#   - No gc.freeze/disable
-#   - Best-checkpoint eval fires after step 300 minimum
-#   - evaluate() called without extra outer autocast wrapper
+# Small ConvNeXt-style network trained entirely from scratch on the font
+# detection dataset. Depthwise-separable convolutions, inverted bottlenecks,
+# LayerNorm, GELU — no pretrained weights.
 #
-# 300-step direct test on this dataset: val_f1=0.52, val_acc=0.87.
-# Expected after full 20-min run: val_f1 > 0.65.
+# Architecture: stem → 4 stages of ConvNeXt blocks → head
+#   dims:   [64, 128, 256, 512]
+#   depths: [2, 2, 6, 2]  (~8M params)
+#
+# Hypothesis: from-scratch should show whether f1=1.0 from pretrained was
+# genuine or just easy overfitting of the 3200-sample eval subset.
 # ---------------------------------------------------------------------------
 
 
-class PretrainedClassifier(nn.Module):
-    def __init__(self, model_name="resnet18", num_classes=15, pretrained=True):
+class ConvNeXtBlock(nn.Module):
+    """ConvNeXt block: depthwise conv → LN → pointwise expand → GELU → pointwise contract."""
+
+    def __init__(self, dim, expand=4, layer_scale=1e-6):
         super().__init__()
-        self.backbone = timm.create_model(
-            model_name, pretrained=pretrained, num_classes=num_classes
-        )
+        self.dw = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.norm = nn.LayerNorm(dim)
+        self.pw1 = nn.Linear(dim, dim * expand)
+        self.pw2 = nn.Linear(dim * expand, dim)
+        self.gamma = nn.Parameter(torch.ones(dim) * layer_scale)
 
     def forward(self, x):
-        return self.backbone(x)
+        residual = x
+        x = self.dw(x)
+        x = x.permute(0, 2, 3, 1)  # NCHW → NHWC for LayerNorm/Linear
+        x = self.norm(x)
+        x = self.pw1(x)
+        x = F.gelu(x)
+        x = self.pw2(x)
+        x = x * self.gamma
+        x = x.permute(0, 3, 1, 2)  # NHWC → NCHW
+        return residual + x
+
+
+class ConvNeXtMicro(nn.Module):
+    """ConvNeXt-Micro from scratch. ~8M params."""
+
+    def __init__(self, num_classes=15, dims=(64, 128, 256, 512), depths=(2, 2, 6, 2)):
+        super().__init__()
+        # Stem: patchify 4×4
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, dims[0], kernel_size=4, stride=4),
+            nn.LayerNorm(dims[0], eps=1e-6) if False else _LNWrapper(dims[0]),
+        )
+        # Stages
+        self.stages = nn.ModuleList()
+        self.downsamples = nn.ModuleList()
+        for i, (dim, depth) in enumerate(zip(dims, depths)):
+            if i > 0:
+                self.downsamples.append(
+                    nn.Sequential(
+                        _LNWrapper(dims[i - 1]),
+                        nn.Conv2d(dims[i - 1], dim, kernel_size=2, stride=2),
+                    )
+                )
+            else:
+                self.downsamples.append(nn.Identity())
+            self.stages.append(
+                nn.Sequential(*[ConvNeXtBlock(dim) for _ in range(depth)])
+            )
+        self.norm = nn.LayerNorm(dims[-1])
+        self.head = nn.Linear(dims[-1], num_classes)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        x = self.stem(x)
+        for down, stage in zip(self.downsamples, self.stages):
+            x = down(x)
+            x = stage(x)
+        x = x.mean(dim=[-2, -1])  # global average pool
+        x = self.norm(x)
+        return self.head(x)
 
     def num_params(self):
         return sum(p.numel() for p in self.parameters())
+
+
+class _LNWrapper(nn.Module):
+    """LayerNorm wrapper that handles NCHW tensors (normalises over C dim)."""
+
+    def __init__(self, num_channels, eps=1e-6):
+        super().__init__()
+        self.ln = nn.LayerNorm(num_channels, eps=eps)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 3, 1)
+        x = self.ln(x)
+        return x.permute(0, 3, 1, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -95,12 +167,12 @@ class PretrainedClassifier(nn.Module):
 # ---------------------------------------------------------------------------
 
 DEVICE_BATCH_SIZE = 64
-BASE_LR = 3e-4
-WEIGHT_DECAY = 1e-4
-WARMUP_STEPS = 50
+BASE_LR = 4e-3  # higher LR for from-scratch (ConvNeXt canonical: 4e-3 with AdamW)
+WEIGHT_DECAY = 0.05  # canonical ConvNeXt weight decay
+WARMUP_STEPS = 200  # longer warmup for from-scratch stability
 LABEL_SMOOTHING = 0.1
-EVAL_FIRST_STEP = 300  # don't checkpoint before this step
-EVAL_EVERY_STEPS = 300  # checkpoint every N steps after that
+EVAL_FIRST_STEP = 300
+EVAL_EVERY_STEPS = 300
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -123,9 +195,7 @@ print(f"Device: {device}")
 _autocast_dtype = torch.bfloat16 if device.type in ("cuda", "mps") else torch.float32
 autocast_ctx = torch.amp.autocast(device_type=device.type, dtype=_autocast_dtype)
 
-model = PretrainedClassifier(
-    model_name="resnet18", num_classes=NUM_CLASSES, pretrained=True
-).to(device)
+model = ConvNeXtMicro(num_classes=NUM_CLASSES).to(device)
 print(f"Model params: {model.num_params() / 1e6:.2f}M")
 
 if device.type != "mps":
