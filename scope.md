@@ -2,27 +2,28 @@
 
 ## Description
 
-<!-- Write a natural language description of the task here. Be specific:
-     - What is the input image?
-     - What are the classes?
-     - What does each class represent?
-     - Any known challenges (class imbalance, fine-grained differences, etc.)?
-     - Dataset hints: can it be generated synthetically? Any known public sources?
--->
+Train a model to detect and classify the font used in a text region of an image.
+Given an input image containing rendered text, the model should identify which font
+(by name) was used to render that text.
 
-**Example task**: Train a model to detect and classify image overlays on photos.
-Given an input image, the model should classify what type of overlay (if any) is present.
-Overlays include: text overlays (subtitles, captions, watermarks), graphic overlays
-(logos, banners, frames), and clean images with no overlay.
+The input is a cropped image patch containing text rendered in a single font.
+The model outputs a font class label corresponding to the font name.
 
-Classes:
-- `clean` — no overlay
-- `text_overlay` — text rendered onto the image (subtitles, captions, watermarks, memes)
-- `graphic_overlay` — non-text graphic elements (logos, banners, frames, channel bugs)
+Classes: one class per font name (e.g. `Arial`, `Times New Roman`, `Roboto`, `Georgia`, etc.).
+The exact class list is defined in the metadata below.
 
-This task can be addressed with synthetic data: take any background image, optionally
-composite a text or graphic overlay onto it, and label accordingly. See `tools/` for
-synthetic generation utilities.
+**Research goal**: Find a novel approach that achieves strong font classification with limited
+training data. Sample efficiency is a core research objective — the approach should not rely
+on scale to succeed, and demonstrating good performance at 2k samples/class is part of what
+makes it novel.
+
+Known challenges:
+- Fine-grained visual similarity between fonts (e.g. serif vs. serif variants)
+- Variation in font size, color, background, and rendering quality
+- Some fonts differ only subtly (e.g. `Helvetica` vs. `Arial`)
+
+This task is well-suited for synthetic data: render text strings using known fonts onto
+varied backgrounds, then label by font name. See `tools/` for synthetic generation utilities.
 
 ---
 
@@ -30,8 +31,24 @@ synthetic generation utilities.
 
 ```json
 {
-  "task_name": "image_overlay",
-  "classes": ["clean", "graphic_overlay", "text_overlay"],
+  "task_name": "font_detection",
+  "classes": [
+    "Arial",
+    "Times New Roman",
+    "Georgia",
+    "Roboto",
+    "Open Sans",
+    "Lato",
+    "Montserrat",
+    "Oswald",
+    "Raleway",
+    "Merriweather",
+    "Playfair Display",
+    "Source Sans Pro",
+    "PT Sans",
+    "Nunito",
+    "Ubuntu"
+  ],
   "metric": "f1_macro"
 }
 ```
@@ -40,31 +57,30 @@ synthetic generation utilities.
 
 ## Dataset Generation Notes
 
-<!-- Expand on how the dataset should be built. The agent will read this. -->
+**Recommended approach**: Fully synthetic generation.
 
-**Recommended approach**: Synthetic generation.
+1. **Font sources**: Download target fonts from Google Fonts or use system-installed fonts.
+   - Google Fonts API or direct download: https://fonts.google.com
+   - Ensure all fonts in the class list are available as `.ttf` or `.otf` files
 
-1. **Background images**: Download a diverse set of background photos. Good sources:
-   - COCO images (unlicensed for research): `datasets` library, `"detection-datasets/coco"`
-   - OpenImages: `datasets` library
-   - Or download ~1000 misc web images via `tools/web_sources.py`
+2. **Text content**: Render varied text strings to expose different character shapes:
+   - Pangrams (e.g. "The quick brown fox jumps over the lazy dog")
+   - Random words and short sentences
+   - Single words and individual characters
+   - Mix of upper/lowercase
 
-2. **Clean samples**: background images with no modification.
+3. **Rendering variation** (use PIL/Pillow):
+   - Font size: 16–96px
+   - Text color: random (dark on light, light on dark)
+   - Background: solid colors, gradients, or cropped natural image patches
+   - Optional: slight rotation (±3°), JPEG compression artifacts, blur
 
-3. **Text overlay samples**: render text onto background images using PIL:
-   - Random fonts from system fonts or Google Fonts
-   - Random text content (lorem ipsum, news headlines, random strings)
-   - Random position (corners, bottom third, center)
-   - Random font size (12–72px), color (white, black, semi-transparent)
-   - Optional: drop shadow, stroke, background box
+4. **Image format**: crop tightly around the text region, with small random padding.
+   Output size: normalize to a fixed height (e.g. 64px) preserving aspect ratio, or
+   use a fixed square crop (e.g. 224×224).
 
-4. **Graphic overlay samples**: composite a small PNG (logo, banner) onto background:
-   - Random logos from a small set of placeholder/generic logos
-   - Random position (corner bugs, top banners)
-   - Random opacity (0.5–1.0)
-
-5. **Class balance**: aim for ~equal numbers per class.
+5. **Class balance**: generate equal numbers of samples per font class.
 
 Target: 2000+ train images per class, 400+ val images per class.
 
-See `tools/synthetic.py` and `tools/overlay.py` (the agent will create these if needed).
+See `tools/synthetic.py` (the agent will create this if needed).
