@@ -15,6 +15,7 @@ if os.environ.get("CUDA_VISIBLE_DEVICES", "0") != "" and True:
     os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import copy
+import json
 import math
 import time
 import gc
@@ -243,7 +244,63 @@ while True:
         print()
         print(f"  [eval @ step {step}, t={total_training_time:.0f}s]", flush=True)
         model.eval()
-        ckpt_results = evaluate(model, TASK_NAME, DEVICE_BATCH_SIZE, metric=METRIC)
+        if device.type == "mps":
+            # MPS bug workaround: save weights to disk, evaluate in a fresh subprocess
+            # to avoid MPS memory state corruption after many training steps.
+            import tempfile, subprocess, pickle
+
+            _raw = model._orig_mod if hasattr(model, "_orig_mod") else model
+            with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as _f:
+                _ckpt_path = _f.name
+            torch.save(_raw.state_dict(), _ckpt_path)
+            _eval_script = f"""
+import sys, json, torch, copy
+sys.path.insert(0, '.')
+import prepare as _prepare
+_prepare.NUM_WORKERS = 0
+from prepare import evaluate, load_scope, get_num_classes
+import torch.nn as nn
+import timm
+
+scope = load_scope()
+TASK_NAME = scope['task_name']
+METRIC = scope['metric']
+NUM_CLASSES = get_num_classes(TASK_NAME)
+
+# Rebuild model architecture (must match train.py)
+class PretrainedClassifier(nn.Module):
+    def __init__(self, model_name='resnet18', num_classes=15, pretrained=False):
+        super().__init__()
+        self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=num_classes)
+    def forward(self, x):
+        return self.backbone(x)
+    def num_params(self):
+        return sum(p.numel() for p in self.parameters())
+
+device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+model = PretrainedClassifier(model_name='resnet18', num_classes=NUM_CLASSES, pretrained=False).to(device)
+state = torch.load('{_ckpt_path}', map_location=device, weights_only=True)
+model.load_state_dict(state)
+model.eval()
+results = evaluate(model, TASK_NAME, {DEVICE_BATCH_SIZE}, metric=METRIC)
+print(json.dumps(results))
+"""
+            _proc = subprocess.run(
+                ["uv", "run", "python3", "-c", _eval_script],
+                capture_output=True,
+                text=True,
+            )
+            import os as _os
+
+            _os.unlink(_ckpt_path)
+            _last_line = _proc.stdout.strip().split("\n")[-1]
+            try:
+                ckpt_results = json.loads(_last_line)
+            except Exception:
+                print(f"  [subprocess eval failed: {_proc.stderr[-500:]}]", flush=True)
+                ckpt_results = {"primary_metric": 0.0, "accuracy": 0.0}
+        else:
+            ckpt_results = evaluate(model, TASK_NAME, DEVICE_BATCH_SIZE, metric=METRIC)
         m = ckpt_results["primary_metric"]
         print(f"  {METRIC}={m:.4f}  acc={ckpt_results['accuracy']:.4f}", flush=True)
         if m > best_metric:
