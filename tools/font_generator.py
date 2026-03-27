@@ -401,24 +401,45 @@ class FontDatasetGenerator(SyntheticDatasetGenerator):
         return img
 
     def _render_sample(self, font_name: str) -> Image.Image:
+        """
+        Render text in the target font as a tight crop.
+
+        Strategy: render text on a large canvas, find the tight bounding box of
+        the actual pixels, add small padding, then resize to img_size×img_size.
+        This maximizes the fraction of the image occupied by font-discriminative
+        glyph shapes rather than background.
+        """
         W = H = self.img_size
 
-        # Pick text — prefer longer strings that expose more glyph shapes
+        # Pick text — use strings that expose multiple glyphs across all fonts
         text = random.choice(ALL_TEXTS)
-        # Sometimes use just a word or two for variety
-        if random.random() < 0.2 and len(text.split()) > 2:
-            words = text.split()
-            text = " ".join(words[: random.randint(2, 4)])
+        # Use a moderate-length string (not too short, not too long)
+        words = text.split()
+        if len(words) > 5:
+            text = " ".join(words[: random.randint(3, 5)])
+        elif len(words) < 2 and len(text) > 10:
+            text = text[: random.randint(8, 15)]
 
-        # Background
-        bg = _make_background(W, H)
+        # Background: mostly clean (white/light) with occasional dark
+        dark_bg = random.random() < 0.3
+        if dark_bg:
+            bg_val = random.randint(10, 60)
+            text_val = random.randint(180, 255)
+        else:
+            bg_val = random.randint(220, 255)
+            text_val = random.randint(0, 60)
+        bg_color = (bg_val, bg_val, bg_val)
+        text_color = (text_val, text_val, text_val)
 
-        # Font size: LARGER range — tiny fonts don't reveal font-specific features
-        # At 224px image, use 28-72px so glyphs are clearly visible
-        font_size = random.randint(28, 72)
+        # Font size: render at large size, then resize → better glyph detail
+        font_size = random.randint(48, 96)
         font = self._get_pil_font(font_name, font_size)
 
-        draw = ImageDraw.Draw(bg)
+        # Render on a large canvas
+        canvas_w = 1200
+        canvas_h = 256
+        canvas = Image.new("RGB", (canvas_w, canvas_h), bg_color)
+        draw = ImageDraw.Draw(canvas)
 
         # Measure text
         try:
@@ -428,57 +449,70 @@ class FontDatasetGenerator(SyntheticDatasetGenerator):
         except Exception:
             tw, th = font_size * len(text) // 2, font_size
 
-        # If text is too wide, truncate to fit within image width with margin
-        margin = 10
-        max_w = W - 2 * margin
-        while tw > max_w and len(text) > 3:
-            text = text[:-2]
+        # If too wide, truncate
+        while tw > canvas_w - 20 and len(text) > 3:
+            text = text[:-2].rstrip()
             try:
                 bbox = draw.textbbox((0, 0), text, font=font)
                 tw = bbox[2] - bbox[0]
                 th = bbox[3] - bbox[1]
             except Exception:
-                tw = font_size * len(text) // 2
-                th = font_size
+                break
 
-        # Position: mostly centered with small random jitter (helps model focus on glyphs)
-        center_x = W // 2 - tw // 2
-        center_y = H // 2 - th // 2
-        jitter_x = random.randint(-20, 20)
-        jitter_y = random.randint(-20, 20)
-        x = max(margin, min(W - tw - margin, center_x + jitter_x))
-        y = max(margin, min(H - th - margin, center_y + jitter_y))
+        # Center on canvas
+        x = max(5, (canvas_w - tw) // 2)
+        y = max(5, (canvas_h - th) // 2)
 
-        # Text color
-        color = _text_color(bg, x, y)
+        # Slight color randomization for variation
+        r_jitter = random.randint(-15, 15)
+        g_jitter = random.randint(-15, 15)
+        b_jitter = random.randint(-15, 15)
+        actual_text_color = (
+            max(0, min(255, text_val + r_jitter)),
+            max(0, min(255, text_val + g_jitter)),
+            max(0, min(255, text_val + b_jitter)),
+        )
 
-        # Optional slight shadow for realism
-        if random.random() < 0.2:
-            shadow_offset = random.randint(1, 2)
-            shadow_color = tuple(
-                max(0, c - 60) if sum(color) > 300 else min(255, c + 60) for c in color
-            )
-            draw.text(
-                (x + shadow_offset, y + shadow_offset),
-                text,
-                font=font,
-                fill=shadow_color,
-            )
+        draw.text((x, y), text, font=font, fill=actual_text_color)
 
-        draw.text((x, y), text, font=font, fill=color)
+        # Find tight bounding box of non-background pixels
+        arr = np.array(canvas)
+        if dark_bg:
+            # Text is light: find bright pixels
+            mask = arr.max(axis=2) > (bg_val + 20)
+        else:
+            # Text is dark: find dark pixels
+            mask = arr.min(axis=2) < (bg_val - 20)
 
-        # Optional blur (simulate slight defocus) — less aggressive
+        rows = np.any(mask, axis=1)
+        cols = np.any(mask, axis=0)
+
+        if rows.any() and cols.any():
+            rmin, rmax = np.where(rows)[0][[0, -1]]
+            cmin, cmax = np.where(cols)[0][[0, -1]]
+            # Add padding (10% of text size)
+            pad = max(8, int((rmax - rmin) * 0.12))
+            rmin = max(0, rmin - pad)
+            rmax = min(canvas_h - 1, rmax + pad)
+            cmin = max(0, cmin - pad)
+            cmax = min(canvas_w - 1, cmax + pad)
+            crop = canvas.crop((cmin, rmin, cmax + 1, rmax + 1))
+        else:
+            # Fallback if no text rendered
+            crop = canvas.crop((x, y, x + tw + 10, y + th + 10))
+
+        # Resize to target size
+        img = crop.resize((W, H), Image.LANCZOS)
+
+        # Light augmentation: mild blur and noise
         if random.random() < 0.1:
-            bg = bg.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.3, 0.8)))
-
-        # Optional JPEG-like noise
+            img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.3, 0.7)))
         if random.random() < 0.1:
-            arr = np.array(bg, dtype=np.float32)
-            noise = np.random.normal(0, random.uniform(3, 10), arr.shape)
-            arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
-            bg = Image.fromarray(arr)
+            arr2 = np.array(img, dtype=np.float32)
+            arr2 += np.random.normal(0, random.uniform(2, 8), arr2.shape)
+            img = Image.fromarray(np.clip(arr2, 0, 255).astype(np.uint8))
 
-        return bg.resize((W, H), Image.LANCZOS)
+        return img
 
 
 # ---------------------------------------------------------------------------
