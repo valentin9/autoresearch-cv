@@ -57,37 +57,30 @@ Cache is at `~/.cache/autoresearch/datasets/<task_name>/`.
 
 ## CRITICAL: Known MPS Training Bug (macOS Apple Silicon)
 
-**Symptom**: model trains (loss decreases to ~1.2) but `evaluate()` always returns
-`val_f1_macro=0.0278`, `val_accuracy=0.125` — i.e. random/collapsed predictions.
+**STATUS: FIXED** — root cause identified and resolved in commit `2cbee7e`.
 
-**Root cause**: NOT fully understood yet. Ruled out:
-- Time-based LR warmup (fixed: now using step-count warmup)
-- Grad accumulation (fixed: removed, using bs=64 direct)
-- Dataset issues (fixed: see scope.md)
-- Class label mismatch (verified: train and val use identical `class_to_idx`)
-- Nested autocast (tested: doesn't affect result)
-- `gc.freeze()/gc.disable()` (tested: doesn't affect result)
-- BatchNorm train vs eval mode (verified: eval mode works correctly in isolation)
+**Root cause**: `non_blocking=True` in `.to(device)` is unsafe on MPS. MPS does not support
+true async host-to-device transfers; using `non_blocking=True` causes a data race where the
+model runs forward on uninitialized/garbage tensor contents. The fix:
 
-**What we know**:
-- Direct test (import model, train 300 steps in a plain script): val_f1=0.52, val_acc=0.87 ✓
-- Full `train.py` run (same model, same data, same hyperparams): val_f1=0.028 ✗
-- The model's loss DOES decrease to ~1.2 during training (not a gradient/LR issue)
-- At checkpoint evals, the model predicts class 0 for almost everything
+```python
+# WRONG — causes silent data corruption on MPS:
+images = images.to(device, non_blocking=True)
 
-**Suspected cause**: something in the `train.py` execution environment (module-level
-side effects, multiprocessing state, MPS memory state) causes a subtle corruption after
-many training steps. The bug does not manifest in a fresh Python process with <400 steps.
+# CORRECT — non_blocking only safe on CUDA:
+_nb = device.type == "cuda"
+images = images.to(device, non_blocking=_nb)
+```
 
-**Workaround to try in a fresh session**:
-1. Use `torch.backends.mps.is_available()` check and fall back to CPU if MPS causes issues
-2. Try running `PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 uv run train.py` (disables MPS caching)
-3. Try moving `import timm` and model creation inside `if __name__ == '__main__':` guard
-4. Try disabling bfloat16 autocast on MPS (use fp32 instead)
-5. If on CUDA (RTX 4090), this bug likely does not apply — just run normally
+**Verification**: 310-step minimal loop with `non_blocking=True` → val_f1=0.028 (collapsed).
+Same loop with `non_blocking=False` → val_f1=0.57 (correct).
 
-**On RTX 4090 (the intended hardware)**: the MPS bug is irrelevant. The training loop
-in `train.py` is otherwise correct — just run it.
+**Other fixes applied (still required)**:
+- Step-count LR warmup (not time-based)
+- No grad accumulation (use bs=64 directly)
+- No gc.freeze() / gc.disable()
+- Checkpoint eval fires no earlier than step 300
+- evaluate() called WITHOUT wrapping in outer autocast context
 
 ---
 
@@ -127,6 +120,19 @@ Edit `train.py` freely:
 - Optimizer, learning rate, schedule, augmentation
 - Batch size, gradient accumulation, precision
 - Loss function, regularization
+
+### Choosing the right learning rate
+
+**Peak LR**: Start with a well-known default for your optimizer and scale based on model size — larger/deeper models generally need a lower LR. If loss stagnates after warmup, increase it; if training is unstable, decrease it.
+
+**Warmup**: Keep warmup short relative to the total training time budget. If warmup consumes too many steps, the model barely trains at peak LR before cosine decay kicks in — most of the budget is wasted ramping up. Prefer short warmups for initial runs and only increase if early instability is observed.
+
+**Diagnosing problems**:
+- Loss barely moves after warmup → LR likely too low
+- Loss spikes or diverges → LR too high or warmup too short
+- Loss plateaus for several generations → try a different LR or treat as converged
+
+**LR finder**: When unsure, sweep LR over a short range and plot loss vs LR. Pick the value just before loss starts rising sharply.
 
 ### What you CANNOT do
 
