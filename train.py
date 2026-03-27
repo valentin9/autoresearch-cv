@@ -147,7 +147,8 @@ optimizer = torch.optim.AdamW(
 criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
 # Estimate total steps for cosine schedule (device-specific throughput)
-_steps_per_sec = {"cuda": 100.0, "mps": 3.0, "cpu": 0.5}
+# MPS updated: ~300 imgs/s at bs=64 => ~4.7 steps/sec on M-series
+_steps_per_sec = {"cuda": 100.0, "mps": 4.7, "cpu": 0.5}
 TOTAL_STEPS = max(1000, int(_steps_per_sec.get(device.type, 1.0) * TIME_BUDGET))
 
 print(f"Estimated total steps: {TOTAL_STEPS}")
