@@ -195,11 +195,25 @@ LOOP FOREVER (once setup is complete):
 
 1. **Review state**: check `results.tsv` and current `train.py`.
 2. **Formulate a hypothesis**: what change might help?
-3. **Edit `train.py`**, commit: `git add train.py && git commit -m "experiment: <desc>"`
-4. **Run**: `uv run train.py > run.log 2>&1`
-5. **Parse results**: `grep "^val_f1_macro:\|^peak_vram_mb:" run.log`
-6. **Log to results.tsv**: `<commit>\t<metric>\t<memory_gb>\t<status>\t<description>`
-7. **Keep or revert**: improved → keep; same/worse → `git reset --hard HEAD~1`
+3. **Create a branch** for the experiment:
+   ```
+   git checkout -b exp/<short-desc>   # e.g. exp/convnext-micro-scratch
+   ```
+4. **Edit `train.py`**, commit: `git add train.py && git commit -m "experiment: <desc>"`
+5. **Run**: `nohup uv run train.py > run.log 2>&1 &`
+6. **Parse results**: `grep "^val_f1_macro:\|^peak_vram_mb:" run.log`
+7. **Log to results.tsv**: include the branch name in the description column.
+8. **Keep or discard**:
+   - Improved → merge branch into `autoresearch/mar27-fonts`:
+     ```
+     git checkout autoresearch/mar27-fonts
+     git merge exp/<short-desc>
+     ```
+   - Same/worse → switch back and delete:
+     ```
+     git checkout autoresearch/mar27-fonts
+     git branch -D exp/<short-desc>
+     ```
 
 **NEVER STOP** until the human interrupts.
 
@@ -227,10 +241,10 @@ num_params_m:        12.34
 ## results.tsv Format
 
 ```
-commit	primary_metric	memory_gb	status	description
-a1b2c3d	0.847231	8.2	keep	baseline ConvNeXt-Micro from scratch
-b2c3d4e	0.861000	9.1	keep	add stochastic depth 0.2
-c3d4e5f	0.843000	8.2	discard	switch to MLP-Mixer (worse)
+commit	branch	primary_metric	memory_gb	status	description
+a1b2c3d	exp/convnext-micro-scratch	0.847231	8.2	keep	baseline ConvNeXt-Micro from scratch
+b2c3d4e	exp/stochastic-depth	0.861000	9.1	keep	add stochastic depth 0.2
+c3d4e5f	exp/mlp-mixer	0.843000	8.2	discard	switch to MLP-Mixer (worse)
 ```
 
 ---
