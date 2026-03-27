@@ -64,19 +64,16 @@ print(f"Time budget: {TIME_BUDGET}s")
 print()
 
 # ---------------------------------------------------------------------------
-# Experiment 4: Pretrained ResNet-18, fixed LR schedule, best-checkpoint eval
+# Experiment 5: ResNet-18 pretrained, step-count LR schedule (fix warmup bug)
 #
-# Root cause from exp 3: model collapses at eval time despite good train loss.
-# Two hypotheses:
-#   A. Model converges then diverges near end of training (cosine LR decays
-#      to 0, but last steps are unstable somehow on MPS bfloat16).
-#   B. Model IS learning but evaluation sees post-divergence weights.
+# Root cause of exp 3/4 failure: TIME-based warmup causes near-zero LR for
+# first 120s of 1200s budget. Model barely learns during warmup phase.
+# Steps 0-5 have total_training_time=0 (LR=0), and warmup reaches peak LR
+# only at t=120s. This starves the model of gradient signal early on.
 #
-# Fix: save best checkpoint by evaluating every ~5 minutes during training,
-# keep best weights, restore before final eval. Also use SGD instead of
-# AdamW which can be more stable at low LR.
-#
-# Architecture: pretrained ResNet-18 (diagnostic baseline, not final goal)
+# Fix: use STEP-COUNT-based LR schedule. Estimate total steps from initial
+# throughput measurement, then schedule properly on steps not wall time.
+# Also: longer warmup in steps terms (100 steps), cosine from there.
 # ---------------------------------------------------------------------------
 
 
@@ -100,11 +97,10 @@ class PretrainedClassifier(nn.Module):
 
 DEVICE_BATCH_SIZE = 64
 TOTAL_BATCH_SIZE = 128
-BASE_LR = 3e-4  # conservative LR for stable fine-tuning
+BASE_LR = 3e-4
 WEIGHT_DECAY = 1e-4
-WARMUP_RATIO = 0.1  # longer warmup
+WARMUP_STEPS = 100  # warmup for 100 optimizer steps (not time-based)
 LABEL_SMOOTHING = 0.1
-EVAL_INTERVAL_SEC = 240  # evaluate every 4 minutes, keep best checkpoint
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -140,11 +136,6 @@ if device.type != "mps":
 assert TOTAL_BATCH_SIZE % DEVICE_BATCH_SIZE == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // DEVICE_BATCH_SIZE
 
-train_loader = make_dataloader(
-    TASK_NAME, DEVICE_BATCH_SIZE, "train", pin_memory=(device.type == "cuda")
-)
-images_per_epoch = len(train_loader) * DEVICE_BATCH_SIZE
-
 optimizer = torch.optim.AdamW(
     model.parameters(),
     lr=BASE_LR,
@@ -156,13 +147,8 @@ optimizer = torch.optim.AdamW(
 
 criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
-print(f"Grad accum steps:   {grad_accum_steps}")
-print(f"Images per epoch:   {images_per_epoch:,}")
-print(f"Total batch size:   {TOTAL_BATCH_SIZE}")
-print()
-
 # ---------------------------------------------------------------------------
-# Training loop with periodic best-checkpoint saving
+# Training utilities
 # ---------------------------------------------------------------------------
 
 
@@ -179,16 +165,51 @@ def peak_memory_mb():
     return 0.0
 
 
+# First, measure throughput to estimate total steps for LR schedule
+print("Measuring throughput...", flush=True)
+model.train()
+train_loader = make_dataloader(
+    TASK_NAME, DEVICE_BATCH_SIZE, "train", pin_memory=(device.type == "cuda")
+)
+images_per_epoch = len(train_loader) * DEVICE_BATCH_SIZE
+train_iter = iter(train_loader)
+
+# Time 10 warmup steps to estimate steps/sec
+_t0 = time.time()
+for _i in range(10):
+    _imgs, _lbls = next(train_iter)
+    _imgs, _lbls = _imgs.to(device), _lbls.to(device)
+    with autocast_ctx:
+        _logits = model(_imgs)
+        _loss = criterion(_logits, _lbls) / grad_accum_steps
+    _loss.backward()
+    if _i % grad_accum_steps == grad_accum_steps - 1:
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+device_synchronize()
+_warmup_time = time.time() - _t0
+_steps_per_sec = (10 / grad_accum_steps) / _warmup_time
+TOTAL_STEPS = max(500, int(_steps_per_sec * TIME_BUDGET))
+print(f"Estimated steps/sec: {_steps_per_sec:.2f}, total steps: {TOTAL_STEPS}")
+print(f"Grad accum steps:    {grad_accum_steps}")
+print(f"Images per epoch:    {images_per_epoch:,}")
+print(f"Total batch size:    {TOTAL_BATCH_SIZE}")
+print()
+
+# Reset optimizer state and model for clean training
+optimizer.zero_grad(set_to_none=True)
+train_iter = iter(train_loader)
+
 t_start_training = time.time()
 total_training_time = 0.0
 step = 0
 total_images = 0
 smooth_loss = 0.0
-train_iter = iter(train_loader)
 
 best_metric = -1.0
 best_state = None
-last_eval_time = 0.0
+last_eval_step = 0
+EVAL_EVERY_STEPS = max(50, TOTAL_STEPS // 5)  # eval ~5 times during training
 
 while True:
     device_synchronize()
@@ -216,14 +237,12 @@ while True:
 
     nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-    # LR schedule: linear warmup -> cosine decay (based on training time progress)
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
-    warmup_frac = WARMUP_RATIO
-    if progress < warmup_frac:
-        lr = BASE_LR * (progress / warmup_frac) if warmup_frac > 0 else BASE_LR
+    # Step-count based LR schedule: linear warmup -> cosine decay
+    if step < WARMUP_STEPS:
+        lr = BASE_LR * (step + 1) / WARMUP_STEPS
     else:
-        t = (progress - warmup_frac) / max(1e-8, 1.0 - warmup_frac)
-        lr = BASE_LR * 0.5 * (1 + math.cos(math.pi * t))
+        t = (step - WARMUP_STEPS) / max(1, TOTAL_STEPS - WARMUP_STEPS)
+        lr = BASE_LR * 0.5 * (1 + math.cos(math.pi * min(t, 1.0)))
 
     for pg in optimizer.param_groups:
         pg["lr"] = lr
@@ -233,17 +252,15 @@ while True:
     device_synchronize()
     t1 = time.time()
     dt = t1 - t0
-
-    if step > 5:
-        total_training_time += dt
-
+    total_training_time += dt
     total_images += TOTAL_BATCH_SIZE
+
     ema_beta = 0.95
     smooth_loss = (
         ema_beta * smooth_loss + (1 - ema_beta) * batch_loss * grad_accum_steps
     )
     debiased = smooth_loss / (1 - ema_beta ** (step + 1))
-    pct_done = 100 * progress
+    pct_done = 100 * min(step / max(1, TOTAL_STEPS), 1.0)
     remaining = max(0, TIME_BUDGET - total_training_time)
     imgs_per_sec = int(TOTAL_BATCH_SIZE / dt)
 
@@ -256,14 +273,17 @@ while True:
     )
 
     # Periodic best-checkpoint evaluation
-    if step > 5 and (total_training_time - last_eval_time) >= EVAL_INTERVAL_SEC:
+    if step > 0 and (step - last_eval_step) >= EVAL_EVERY_STEPS:
         print()
-        print(f"  [checkpoint eval @ {total_training_time:.0f}s]", flush=True)
+        print(f"  [eval @ step {step}, t={total_training_time:.0f}s]", flush=True)
         model.eval()
         with autocast_ctx:
             ckpt_results = evaluate(model, TASK_NAME, DEVICE_BATCH_SIZE, metric=METRIC)
         ckpt_metric = ckpt_results["primary_metric"]
-        print(f"  checkpoint {METRIC}: {ckpt_metric:.4f}", flush=True)
+        print(
+            f"  {METRIC}: {ckpt_metric:.4f} | acc: {ckpt_results['accuracy']:.4f}",
+            flush=True,
+        )
         if ckpt_metric > best_metric:
             best_metric = ckpt_metric
             best_state = copy.deepcopy(
@@ -271,7 +291,7 @@ while True:
             )
             print(f"  *** new best: {best_metric:.4f} ***", flush=True)
         model.train()
-        last_eval_time = total_training_time
+        last_eval_step = step
 
     if step == 0:
         gc.collect()
@@ -280,7 +300,7 @@ while True:
 
     step += 1
 
-    if step > 5 and total_training_time >= TIME_BUDGET:
+    if total_training_time >= TIME_BUDGET:
         break
 
 print()
