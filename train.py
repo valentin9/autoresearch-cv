@@ -198,8 +198,11 @@ autocast_ctx = torch.amp.autocast(device_type=device.type, dtype=_autocast_dtype
 model = ConvNeXtMicro(num_classes=NUM_CLASSES).to(device)
 print(f"Model params: {model.num_params() / 1e6:.2f}M")
 
-if device.type != "mps":
-    model = torch.compile(model, dynamic=False)
+if device.type == "cuda" and torch.cuda.is_available():
+    try:
+        model = torch.compile(model, dynamic=False)
+    except Exception:
+        pass  # skip compile if no C compiler available (e.g. WSL without build-essential)
 
 train_loader = make_dataloader(
     TASK_NAME, DEVICE_BATCH_SIZE, "train", pin_memory=(device.type == "cuda")
