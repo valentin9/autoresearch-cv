@@ -165,8 +165,17 @@ def peak_memory_mb():
     return 0.0
 
 
-# First, measure throughput to estimate total steps for LR schedule
-print("Measuring throughput...", flush=True)
+# Estimate total steps based on device capability (no warmup measurement to avoid state pollution)
+# MPS (Apple M-series): ~1.5 steps/sec with grad_accum=2, ResNet-18
+# RTX 4090 CUDA: ~50+ steps/sec
+_device_steps_est = {
+    "cuda": 50.0,
+    "mps": 1.5,
+    "cpu": 0.3,
+}
+_est_steps_per_sec = _device_steps_est.get(device.type, 1.0) / grad_accum_steps
+TOTAL_STEPS = max(500, int(_est_steps_per_sec * TIME_BUDGET))
+
 model.train()
 train_loader = make_dataloader(
     TASK_NAME, DEVICE_BATCH_SIZE, "train", pin_memory=(device.type == "cuda")
@@ -174,23 +183,7 @@ train_loader = make_dataloader(
 images_per_epoch = len(train_loader) * DEVICE_BATCH_SIZE
 train_iter = iter(train_loader)
 
-# Time 10 warmup steps to estimate steps/sec
-_t0 = time.time()
-for _i in range(10):
-    _imgs, _lbls = next(train_iter)
-    _imgs, _lbls = _imgs.to(device), _lbls.to(device)
-    with autocast_ctx:
-        _logits = model(_imgs)
-        _loss = criterion(_logits, _lbls) / grad_accum_steps
-    _loss.backward()
-    if _i % grad_accum_steps == grad_accum_steps - 1:
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-device_synchronize()
-_warmup_time = time.time() - _t0
-_steps_per_sec = (10 / grad_accum_steps) / _warmup_time
-TOTAL_STEPS = max(500, int(_steps_per_sec * TIME_BUDGET))
-print(f"Estimated steps/sec: {_steps_per_sec:.2f}, total steps: {TOTAL_STEPS}")
+print(f"Estimated total steps: {TOTAL_STEPS}")
 print(f"Grad accum steps:    {grad_accum_steps}")
 print(f"Images per epoch:    {images_per_epoch:,}")
 print(f"Total batch size:    {TOTAL_BATCH_SIZE}")
